@@ -3,22 +3,30 @@
 ## Mimari Felsefe ve Amaç
 
 Bu doküman, Notia'nın çekirdek veri modelini tanımlar. Bu modelin temel amacı, uygulamanın sadece bugün "tek cihazda" çalışmasını değil, yarın "birden fazla cihazda eşzamanlı (multiplayer)" çalışmasını sağlamaktır.
-
 Tüm modellerimiz şu 4 temel sütuna dayanır:
-1.  **Immutable (Değişmezlik):** Modeller oluşturulduktan sonra içindeki veriler değiştirilemez (`val` kullanımı). Neden? Çünkü ekran saniyede 120 kez yenilenirken verinin aniden değişmesi uygulamayı çökertir (Race Condition).
+
+1.  **Immutable (Değişmezlik):** Modeller oluşturulduktan sonra içindeki veriler değiştirilemez (`val` kullanımı). Neden? Çünkü ekran saniyede 120 kez yenilenirken verinin aniden değişmesi uygulamayı çökertir (Race Condition). Sık değişen hiyerarşik yapılar (Page, Layer, Notebook) için GC baskısını sıfırlamak adına `PersistentList` kullanılır. Bir kez yazılıp mühürlenen ham veriler (Stroke.points) için ise okuma hızını maksimize etmek adına standart `List` kullanılır.
+    
 2.  **Event-Sourced (Olay Tabanlı):** Veri silinmez, "silindi" olarak işaretlenir. Neden? "Geri Al" (Undo) yapabilmek ve geçmişi kaybetmemek için.
+    
 3.  **CRDT-Safe (Çakışma Korumalı):** Aynı nota iki kişi aynı anda çizim yaparsa veriler birbirine girmesin diye her nesnenin bir zaman damgası (version) ve benzersiz kimliği (UUID) vardır.
+    
 4.  **Device-Agnostic (Cihaz Bağımsız):** Koordinatlar cihazın ekranına göre değil, "Sanal bir kağıda" göre tutulur. Neden? Notu S9+ tabletten telefona attığında çizgiler kaymasın diye.
+    
 
 > **Yapay Zeka Asistanları İçin Not:** Bu dosya uygulamanın anayasasıdır. Modeller doğrudan değiştirilmez, tüm state mutasyonları Command Pattern üzerinden geçmelidir. Alt kısımdaki YASAK listesine kesinlikle uyulacaktır.
 
----
+* * *
 
-## Modeller (Path: `app/src/main/java/com/yourdomain/notes/domain/model/DrawingDataModels.kt`)
+## Modeller (Path: `app/src/main/java/com/notia/domain/model/DrawingDataModels.kt`)
 
-```kotlin
-package com.yourdomain.notes.domain.model
+Kotlin
 
+```
+package com.notia.domain.model
+
+import kotlinx.collections.immutable.PersistentList
+import kotlinx.collections.immutable.persistentListOf
 import java.util.UUID
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -40,10 +48,6 @@ enum class ToolType {
 //
 // Neden x ve y Canonical (Oransal)? Tabletlerin ekran çözünürlükleri farklıdır. 
 // Fiziksel pikselleri kaydedersek, not başka bir cihazda bozuk görünür. 
-// Bu yüzden "2000x3000'lik sanal bir kağıdın neresinde?" sorusunu kaydederiz.
-//
-// Neden Milisaniye değil Nanosaniye? Çünkü hızlı bir çizimde aynı milisaniyeye
-// birden fazla nokta sığabilir. Nanosaniye noktaların sırasının karışmasını engeller.
 // ─────────────────────────────────────────────────────────────────────────────
 data class StylusPoint(
     val x: Float,            // Sanal kağıt üzerindeki X koordinatı
@@ -58,35 +62,40 @@ data class StylusPoint(
 // 3. STROKE (Çizgi - Dokular)
 // Yüzlerce StylusPoint'in birleşerek oluşturduğu tek bir çizgi hareketi.
 //
-// Neden deviceId var? İki arkadaş aynı deftere yazarken kimin ne çizdiğini bilmek için.
-// Neden isDeleted var? Çizgiyi sildiğimizde tamamen yok etmeyip 'gizleriz' ki,
-// kullanıcı "Geri Al" butonuna bastığında çizgi kolayca geri gelsin.
+// DİKKAT: 'points' değişkeni KESİNLİKLE standart List olmalıdır.
+// Neden PersistentList değil? Çünkü Stroke tamamlandığında (endStroke) noktalar 
+// bir kez yazılır ve bir daha asla mutate edilmez. Trie yapısı kurmak belleği 
+// gereksiz yorar ve render anındaki okuma hızını (O(1) dizilimini) bozar.
 // ─────────────────────────────────────────────────────────────────────────────
 data class Stroke(
     val id: String = UUID.randomUUID().toString(), // Dünyada eşi olmayan kimlik numarası
     val toolType: ToolType,          // Hangi kalemle çizildi?
     val color: Int,                  // Rengi ne?
     val baseWidth: Float,            // Kalınlığı ne kadar?
-    val points: List<StylusPoint>,   // Hangi noktalardan geçti?
+    val points: List<StylusPoint>,   // Hangi noktalardan geçti? (STANDART LIST - O(1) Read)
     val createdAt: Long,             // Ne zaman çizilmeye başlandı?
-    val version: Long = System.nanoTime(), // Çakışma çözümünde "En son yazan kazanır" kuralı için
-    val deviceId: String,            // Hangi cihaz / kullanıcı çizdi?
+    val version: Long = System.nanoTime(), // Çakışma çözümünde "En son yazan kazanır" kuralı
+    val deviceId: String,            // Hangi cihaz/kullanıcı çizdi? (CRDT için zorunlu)
     val isDeleted: Boolean = false,  // Silindi mi? (Soft-delete)
-    val textMetadata: String? = null // İleride yapay zeka el yazısını okursa buraya yazacak
+    val textMetadata: String? = null, // İleride yapay zeka el yazısını okursa buraya yazacak
+    
+    // ── LASSO VE SÜRÜKLEME OPTİMİZASYONU (Sıfır Gecikme) ──
+    // Sürükleme esnasında binlerce noktanın koordinatını değiştirmek cihazı dondurur.
+    // Kullanıcı UI'da Lasso ile sürüklerken O(1) maliyetle offset güncellenir,
+    // C++ Render Engine'e "bu çizgiyi çizerken şu kadar kaydır" denilir.
+    val transformOffsetX: Float = 0f, 
+    val transformOffsetY: Float = 0f
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. LAYER (Katman - Organlar)
 // Tıp anatomi görselleri gibi karmaşık yapılarda, resmin üzerine direkt çizmemek
 // ve ayrı bir şeffaf katmanda çalışmak için kullanılır.
-// 
-// Neden 'order' (Sıra) adında bir değişken yok? Çünkü katmanın sırasını, 
-// listenin içindeki konumu belirler. Hem order hem liste sırası olursa çakışma yaşanır.
 // ─────────────────────────────────────────────────────────────────────────────
 data class Layer(
     val id: String = UUID.randomUUID().toString(),
     val title: String,               // Örn: "Kemikler", "Sinirler", "Benim Notlarım"
-    val strokes: List<Stroke> = emptyList(),
+    val strokes: PersistentList<Stroke> = persistentListOf(), // Sık ekleme/çıkarma için GC Korumalı
     val isVisible: Boolean = true,   // Göz simgesi (Katmanı gizle/göster)
     val isLocked: Boolean = false    // Kilit simgesi (Yanlışlıkla silmeyi önle)
 )
@@ -96,17 +105,14 @@ data class Layer(
 // 
 // Neden widthPx ve heightPx sabit (2000x3000)? Çünkü her ekran farklıdır ama
 // kağıdın boyutu standart olmalıdır (A4 kağıdı gibi). Her şey bu kağıda göre oranlanır.
-// 
-// Neden version var? İnternet koptuğunda offline çizim yaparsan, internet geldiğinde
-// binlerce noktayı tek tek kontrol etmek yerine sadece sayfa versiyonuna bakıp senkronize olmak için.
 // ─────────────────────────────────────────────────────────────────────────────
 data class Page(
     val id: String = UUID.randomUUID().toString(),
     val pageNumber: Int,
     val widthPx: Float = 2000f,      // Sanal kağıt genişliği (Değişmez kural)
     val heightPx: Float = 3000f,     // Sanal kağıt yüksekliği (Değişmez kural)
-    val version: Long = System.nanoTime(), // Sayfada bir şey değişirse bu nanosaniye güncellenir
-    val layers: List<Layer> = listOf(Layer(title = "Default"))
+    val version: Long = System.nanoTime(), // Sayfada bir şey değişirse nanosaniye güncellenir
+    val layers: PersistentList<Layer> = persistentListOf(Layer(title = "Default")) // GC Korumalı
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -116,22 +122,30 @@ data class Page(
 data class Notebook(
     val id: String = UUID.randomUUID().toString(),
     val title: String,               // Defterin adı
-    val pages: List<Page> = emptyList(),
+    val pages: PersistentList<Page> = persistentListOf(), // GC Korumalı
     val createdAt: Long = System.nanoTime(),
     val lastModifiedAt: Long = System.nanoTime(),
     val coverColor: Int              // Defter kapağının rengi
 )
 ```
 
----
+* * *
 
 ## ⛔ YAPAY ZEKA VE GELİŞTİRİCİLER İÇİN KESİN KURALLAR (YASAK LİSTESİ)
 
 Mimarinin çökmemesi için aşağıdaki kurallara %100 uyulacaktır:
 
 1.  **Sabitleri Değiştirme YASAĞI:** `ToolType` enum içindeki sabitler silinemez veya yeniden adlandırılamaz (Geçmiş veritabanlarıyla uyumluluğu bozar).
+    
 2.  **ID ve Tarih Oynama YASAĞI:** `Stroke.id` ve `createdAt` değerleri oluşturulduktan sonra asla değiştirilemez.
-3.  **Değişmezlik (Immutability) YASAĞI:** Hiçbir modelin içinde `var` kelimesi kullanılamaz. Modeller salt okunurdur (`val`). Değişiklikler sadece `copy()` fonksiyonu ile yeni bir kopya üretilerek yapılır.
+    
+3.  **Değişmezlik (Immutability) YASAĞI:** Hiçbir modelin içinde `var` kelimesi kullanılamaz. Modeller salt okunurdur (`val`). Değişiklikler sadece `copy()` fonksiyonu ile yeni bir kopya üretilerek (Command Pattern üzerinden) yapılır.
+    
 4.  **Zaman Birimi YASAĞI:** Tüm zaman damgaları (`timestamp`, `createdAt`, `version`) **nanosaniye** cinsinden olmak zorundadır. Milisaniye kullanılamaz.
+    
 5.  **Ham Piksel YASAĞI:** Ekrana dokunulan koordinatlar (`rawX`, `rawY`) modele direkt kaydedilemez. Input katmanında mutlaka `widthPx` ve `heightPx`'e göre oranlanarak (Canonical formata dönüştürülerek) kaydedilmelidir.
+    
 6.  **Çapraz Referans (Cross-Reference) YASAĞI:** Modeller arası ID referansı kullanmak yasaktır. Yapı kesinlikle `Notebook -> Page -> Layer -> Stroke` şeklinde hiyerarşik bir ağaç (Tree Structure) olarak kalmalıdır.
+    
+7.  **Standart Koleksiyon YASAĞI (Kısmi İstisna İle):** Sık değişen ve Command Pattern ile güncellenen listeler (`Layer.strokes`, `Page.layers`, `Notebook.pages`) için standart `List` KESİNLİKLE kullanılamaz. Bellek referanslarının paylaşılması (Structural Sharing) ve GC dostu kopyalama için **daima** `PersistentList` kullanılacaktır.
+    *   _İSTİSNA:_ Yalnızca bir kez yazılıp mühürlenen ve render iterasyonlarında O(1) hızında okunması gereken `Stroke.points` koleksiyonu bu kuraldan muaftır ve standart `List` olmak **zorundadır**.
